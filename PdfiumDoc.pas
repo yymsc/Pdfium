@@ -63,9 +63,6 @@ type
     function  GetLastErrorText: string;
 
     // TIFF-Hilfsmethoden
-    procedure WriteTiffHeader(Stream: TStream; PageCount, ImageWidth, ImageHeight,
-                              DPI: Integer; Compression: TTiffCompression;
-                              Grayscale: Boolean; IFDOffset: Cardinal);
     procedure WriteTiffIFD(Stream: TStream; PageIndex, PageCount,
                            ImageWidth, ImageHeight, DPI: Integer;
                            Compression: TTiffCompression; Grayscale: Boolean;
@@ -247,12 +244,11 @@ begin
     if Width  < 1 then Width  := 1;
     if Height < 1 then Height := 1;
 
+    // Grayscale: echtes 1-bpp-Bitmap via CreateEx;  Farbe: 3-bpp BGRx
     if Grayscale then
-      Fmt := FPDFBitmap_Gray
+      Bitmap := FPDFBitmap_CreateEx(Width, Height, FPDFBitmap_Gray, nil, 0)
     else
-      Fmt := FPDFBitmap_BGR;
-
-    Bitmap := FPDFBitmap_Create(Width, Height, 0 {no alpha});
+      Bitmap := FPDFBitmap_Create(Width, Height, 0 {no alpha});
     if Bitmap = nil then
       raise EPdfiumError.Create('FPDFBitmap_Create fehlgeschlagen.');
     try
@@ -270,7 +266,7 @@ begin
 
       if Grayscale then
       begin
-        // 1 Byte pro Pixel
+        // 1 Byte pro Pixel – Stride kann >= Width sein (Padding)
         SetLength(Result, Width * Height);
         Dst := Pointer(Result);
         for Row := 0 to Height - 1 do
@@ -278,7 +274,7 @@ begin
       end
       else
       begin
-        // 3 Bytes pro Pixel (BGR)
+        // 3 Bytes pro Pixel (BGR) – Stride kann > Width*3 sein
         SetLength(Result, Width * Height * 3);
         Dst := Pointer(Result);
         for Row := 0 to Height - 1 do
@@ -520,46 +516,57 @@ const
   TIFF_COMPR_LZW       = 5;
   TIFF_COMPR_PACKBITS  = 32773;
 
-procedure TPdfDocument.WriteTiffHeader(Stream: TStream; PageCount, ImageWidth,
-  ImageHeight, DPI: Integer; Compression: TTiffCompression; Grayscale: Boolean;
-  IFDOffset: Cardinal);
-begin
-  // TIFF Magic: Little-Endian
-  Stream.WriteBuffer(AnsiString('II'), 2);
-  WriteWord(Stream, 42);        // Magic Number
-  WriteDWord(Stream, IFDOffset); // Offset zum ersten IFD
-end;
-
 procedure TPdfDocument.WriteTiffIFD(Stream: TStream; PageIndex, PageCount,
   ImageWidth, ImageHeight, DPI: Integer; Compression: TTiffCompression;
   Grayscale: Boolean; DataOffset: Cardinal; DataSize: Cardinal;
   NextIFDOffset: Cardinal);
-const
-  TAG_COUNT_COLOR     = 13;
-  TAG_COUNT_GRAY      = 12;
+{
+  IFD-Layout (Little-Endian):
+    2 Bytes  TagCount
+    TagCount × 12 Bytes  Tag-Einträge
+    4 Bytes  NextIFDOffset
+    [6 Bytes  BitsPerSample 8/8/8  – nur Farbe]
+    8 Bytes  XResolution  RATIONAL
+    8 Bytes  YResolution  RATIONAL
+
+  Inline-Daten liegen unmittelbar nach dem NextIFD-DWORD.
+  IFDEnd zeigt auf den ersten Byte der Inline-Daten.
+}
 var
   TagCount      : Word;
   ComprValue    : Cardinal;
   PhotoValue    : Cardinal;
   SamplesPerPix : Cardinal;
-  RatNum, RatDen: Cardinal;
-  ExtraDataOff  : Cardinal;  // Offset für RATIONAL-Daten (DPI)
+  IFDEnd        : Cardinal;  // Offset des ersten Inline-Datenbytes
+  BPSOffset     : Cardinal;  // Offset BitsPerSample-Extra  (nur Farbe)
+  XResOffset    : Cardinal;  // Offset XResolution RATIONAL
+  YResOffset    : Cardinal;  // Offset YResolution RATIONAL
 begin
-  // DPI als RATIONAL: 2 x 8 Bytes nach dem IFD-Block
-  // IFD-Größe: 2 + TagCount*12 + 4 (NextIFD)
-  if Grayscale then
-    TagCount := TAG_COUNT_GRAY
-  else
-    TagCount := TAG_COUNT_COLOR;
+  // TagCount:
+  //   12 feste Tags + 1 PageNumber (nur wenn Mehrseiten-TIFF)
+  TagCount := 12;
+  if PageCount > 1 then Inc(TagCount);
 
-  ExtraDataOff := Stream.Position + 2 + TagCount * 12 + 4;
-  // Für Farbe: noch 6 Bytes für BitsPerSample (3 x SHORT)
-  if not Grayscale then
-    Inc(ExtraDataOff, 6);
+  // IFDEnd = Byte unmittelbar nach IFD-Block (2 + TagCount*12 + 4)
+  IFDEnd := Cardinal(Stream.Position) + 2 + TagCount * 12 + 4;
+
+  // Inline-Datenoffsets
+  if Grayscale then
+  begin
+    // Kein BitsPerSample-Extra (1 × SHORT passt in den Tag-Value)
+    XResOffset := IFDEnd;
+    YResOffset := IFDEnd + 8;
+  end
+  else
+  begin
+    BPSOffset  := IFDEnd;        // 3 × SHORT = 6 Bytes
+    XResOffset := IFDEnd + 6;
+    YResOffset := IFDEnd + 14;
+  end;
 
   case Compression of
-    tcNone     : ComprValue := TIFF_COMPR_NONE;
-    tcLZW      : ComprValue := TIFF_COMPR_LZW;
+    tcNone : ComprValue := TIFF_COMPR_NONE;
+    tcLZW  : ComprValue := TIFF_COMPR_LZW;
   else
     ComprValue := TIFF_COMPR_PACKBITS;
   end;
@@ -575,51 +582,30 @@ begin
     SamplesPerPix := 3;
   end;
 
+  // Tags schreiben – Tags MÜSSEN aufsteigend nach Tag-ID sortiert sein
   WriteWord(Stream, TagCount);
-
-  // ImageWidth
-  WriteTiffTag(Stream, TIFF_IMAGEWIDTH, TIFF_LONG, 1, Cardinal(ImageWidth));
-  // ImageLength
-  WriteTiffTag(Stream, TIFF_IMAGELENGTH, TIFF_LONG, 1, Cardinal(ImageHeight));
-  // BitsPerSample
+  WriteTiffTag(Stream, TIFF_IMAGEWIDTH,      TIFF_LONG,     1, Cardinal(ImageWidth));
+  WriteTiffTag(Stream, TIFF_IMAGELENGTH,     TIFF_LONG,     1, Cardinal(ImageHeight));
   if Grayscale then
-    WriteTiffTag(Stream, TIFF_BITSPERSAMPLE, TIFF_SHORT, 1, 8)
+    WriteTiffTag(Stream, TIFF_BITSPERSAMPLE, TIFF_SHORT,    1, 8)
   else
-    // 3 Samples à 8 Bit → Wert ist Offset auf die 3 WORDs
-    WriteTiffTag(Stream, TIFF_BITSPERSAMPLE, TIFF_SHORT, 3, ExtraDataOff);
-  // Compression
-  WriteTiffTag(Stream, TIFF_COMPRESSION, TIFF_SHORT, 1, ComprValue);
-  // PhotometricInterpretation
-  WriteTiffTag(Stream, TIFF_PHOTOMETRIC, TIFF_SHORT, 1, PhotoValue);
-  // StripOffsets
-  WriteTiffTag(Stream, TIFF_STRIPOFFSETS, TIFF_LONG, 1, DataOffset);
-  // SamplesPerPixel
-  WriteTiffTag(Stream, TIFF_SAMPLESPERPIXEL, TIFF_SHORT, 1, SamplesPerPix);
-  // RowsPerStrip
-  WriteTiffTag(Stream, TIFF_ROWSPERSTRIP, TIFF_LONG, 1, Cardinal(ImageHeight));
-  // StripByteCounts
-  WriteTiffTag(Stream, TIFF_STRIPBYTECOUNTS, TIFF_LONG, 1, DataSize);
-  // XResolution – RATIONAL, Offset in ExtraData
-  if not Grayscale then
-    WriteTiffTag(Stream, TIFF_XRESOLUTION, TIFF_RATIONAL, 1, ExtraDataOff + 6)
-  else
-    WriteTiffTag(Stream, TIFF_XRESOLUTION, TIFF_RATIONAL, 1, ExtraDataOff);
-  // YResolution
-  if not Grayscale then
-    WriteTiffTag(Stream, TIFF_YRESOLUTION, TIFF_RATIONAL, 1, ExtraDataOff + 14)
-  else
-    WriteTiffTag(Stream, TIFF_YRESOLUTION, TIFF_RATIONAL, 1, ExtraDataOff + 8);
-  // ResolutionUnit  (2 = Inch)
-  WriteTiffTag(Stream, TIFF_RESOLUTIONUNIT, TIFF_SHORT, 1, 2);
-  // PageNumber (nur bei Mehrseiten)
+    WriteTiffTag(Stream, TIFF_BITSPERSAMPLE, TIFF_SHORT,    3, BPSOffset);
+  WriteTiffTag(Stream, TIFF_COMPRESSION,     TIFF_SHORT,    1, ComprValue);
+  WriteTiffTag(Stream, TIFF_PHOTOMETRIC,     TIFF_SHORT,    1, PhotoValue);
+  WriteTiffTag(Stream, TIFF_STRIPOFFSETS,    TIFF_LONG,     1, DataOffset);
+  WriteTiffTag(Stream, TIFF_SAMPLESPERPIXEL, TIFF_SHORT,    1, SamplesPerPix);
+  WriteTiffTag(Stream, TIFF_ROWSPERSTRIP,    TIFF_LONG,     1, Cardinal(ImageHeight));
+  WriteTiffTag(Stream, TIFF_STRIPBYTECOUNTS, TIFF_LONG,     1, DataSize);
+  WriteTiffTag(Stream, TIFF_XRESOLUTION,     TIFF_RATIONAL, 1, XResOffset);
+  WriteTiffTag(Stream, TIFF_YRESOLUTION,     TIFF_RATIONAL, 1, YResOffset);
+  WriteTiffTag(Stream, TIFF_RESOLUTIONUNIT,  TIFF_SHORT,    1, 2); // 2 = Inch
   if PageCount > 1 then
-    WriteTiffTag(Stream, TIFF_PAGENUMBER, TIFF_SHORT, 2,
+    WriteTiffTag(Stream, TIFF_PAGENUMBER,    TIFF_SHORT,    2,
                  Cardinal(PageIndex) or (Cardinal(PageCount) shl 16));
 
-  // Next IFD Offset
   WriteDWord(Stream, NextIFDOffset);
 
-  // Extra-Daten: BitsPerSample für RGB (3 x SHORT = 6 Bytes)
+  // Inline-Daten: BitsPerSample (nur Farbe: 3 × 8-Bit)
   if not Grayscale then
   begin
     WriteWord(Stream, 8);
@@ -627,14 +613,12 @@ begin
     WriteWord(Stream, 8);
   end;
 
-  // XResolution als RATIONAL (DPI/1)
-  RatNum := Cardinal(DPI);
-  RatDen := 1;
-  WriteDWord(Stream, RatNum);
-  WriteDWord(Stream, RatDen);
-  // YResolution
-  WriteDWord(Stream, RatNum);
-  WriteDWord(Stream, RatDen);
+  // XResolution RATIONAL  (DPI / 1)
+  WriteDWord(Stream, Cardinal(DPI));
+  WriteDWord(Stream, 1);
+  // YResolution RATIONAL  (DPI / 1)
+  WriteDWord(Stream, Cardinal(DPI));
+  WriteDWord(Stream, 1);
 end;
 
 // ============================================================
@@ -840,14 +824,26 @@ end;
 
 procedure TPdfDocument.SavePageToTiff(const TiffFile: string;
   PageIndex: Integer; const Options: TTiffOptions);
+{
+  Einzelseite-TIFF, kein PageNumber-Tag (TagCount = 12).
+
+  IFD-Größen (TagCount=12):
+    Farbe:  2 + 12*12 + 4 + 6 (BPS) + 16 (2 RATIONALs) = 172 Bytes
+    Grau:   2 + 12*12 + 4 + 0       + 16               = 166 Bytes
+  DataOffset = 8 (Header) + IFDSize
+}
+const
+  IFD_SIZE_COLOR_SINGLE = 2 + 12 * 12 + 4 + 6 + 16; // 172
+  IFD_SIZE_GRAY_SINGLE  = 2 + 12 * 12 + 4 + 16;      // 166
 var
-  MS        : TMemoryStream;
-  PixData   : TBytes;
-  CompData  : TBytes;
-  PW, PH    : Integer;
-  Scale     : Double;
-  IFDOffset : Cardinal;
-  DataOffset: Cardinal;
+  MS         : TMemoryStream;
+  PixData    : TBytes;
+  CompData   : TBytes;
+  PW, PH     : Integer;
+  Scale      : Double;
+  DataOffset : Cardinal;
+  i          : Integer;
+  Tmp        : Byte;
 begin
   CheckLoaded;
 
@@ -859,10 +855,10 @@ begin
   // BGR → RGB umwandeln (TIFF erwartet RGB)
   if not Options.Grayscale then
   begin
-    var i := 0;
+    i := 0;
     while i < Length(PixData) - 2 do
     begin
-      var Tmp := PixData[i];
+      Tmp            := PixData[i];
       PixData[i]     := PixData[i + 2];
       PixData[i + 2] := Tmp;
       Inc(i, 3);
@@ -876,38 +872,30 @@ begin
     CompData := PixData;
   end;
 
+  // DataOffset korrekt vor dem Schreiben berechnen
+  if Options.Grayscale then
+    DataOffset := 8 + IFD_SIZE_GRAY_SINGLE
+  else
+    DataOffset := 8 + IFD_SIZE_COLOR_SINGLE;
+
   MS := TMemoryStream.Create;
   try
-    // TIFF-Header: 8 Bytes, danach kommt das IFD
-    IFDOffset := 8;
-
-    // Platzhalter-Header schreiben
+    // TIFF-Header (8 Bytes): Magic 'II', 42, Offset erstes IFD
     MS.WriteBuffer(AnsiString('II'), 2);
     WriteWord(MS, 42);
-    WriteDWord(MS, IFDOffset);
+    WriteDWord(MS, 8);  // IFD beginnt unmittelbar nach dem Header
 
-    // IFD schreiben
-    // DataOffset = Position nach IFD + ExtraData
-    // Wir schreiben IFD, merken uns DataOffset danach
-    WriteTiffIFD(MS, 0, 1, PW, PH, Options.DPI, Options.Compression,
-                 Options.Grayscale,
-                 0,   // DataOffset – wird nachher gepatcht
-                 Cardinal(Length(CompData)),
-                 0);
+    WriteTiffIFD(MS, 0, 1 {single page}, PW, PH, Options.DPI,
+                 Options.Compression, Options.Grayscale,
+                 DataOffset, Cardinal(Length(CompData)),
+                 0 {kein nächstes IFD});
 
-    // tatsächlicher Datenoffset
-    DataOffset := MS.Size;
+    // Sicherstellen, dass Stream-Position mit DataOffset übereinstimmt
+    Assert(Cardinal(MS.Size) = DataOffset,
+           Format('TIFF DataOffset-Mismatch: erwartet %d, tatsächlich %d',
+                  [DataOffset, MS.Size]));
 
-    // zurückgehen und DataOffset in StripOffsets patchen
-    // StripOffsets ist der 6. Tag (Index 5), jeder Tag = 12 Bytes
-    // IFD-Start: 8 (Header) + 2 (TagCount) = 10
-    // Tag 5 (0-basiert): 10 + 5*12 = 70, Value-Feld bei Offset +8 → 78
-    MS.Position := IFDOffset + 2 + 5 * 12 + 8;
-    WriteDWord(MS, DataOffset);
-
-    MS.Position := MS.Size;
     MS.WriteBuffer(CompData[0], Length(CompData));
-
     MS.SaveToFile(TiffFile);
   finally
     MS.Free;
@@ -963,13 +951,13 @@ begin
     // BGR → RGB
     if not Options.Grayscale then
     begin
-      var i := 0;
-      while i < Length(PixData) - 2 do
+      var SwapI := 0;
+      while SwapI < Length(PixData) - 2 do
       begin
-        var Tmp := PixData[i];
-        PixData[i]     := PixData[i + 2];
-        PixData[i + 2] := Tmp;
-        Inc(i, 3);
+        var SwapTmp     := PixData[SwapI];
+        PixData[SwapI]  := PixData[SwapI + 2];
+        PixData[SwapI + 2] := SwapTmp;
+        Inc(SwapI, 3);
       end;
     end;
 
@@ -986,17 +974,17 @@ begin
   // Für jede Seite: IFD-Block (berechnet in WriteTiffIFD) + Bilddaten
   // Wir berechnen Offsets in zwei Schritten.
 
-  // Schritt 1: IFD-Größen bestimmen
-  // Für Farbe: TagCount=13, Größe = 2 + 13*12 + 4 + 6 (BPS-Extra) + 16 (2 Rationals) = 184
-  // Für Grau:  TagCount=12, Größe = 2 + 12*12 + 4 + 16 = 166
-  const IFD_SIZE_COLOR = 2 + 13*12 + 4 + 6 + 16;
-  const IFD_SIZE_GRAY  = 2 + 12*12 + 4 + 16;
+  // IFD-Größen für Mehrseiten-TIFF (TagCount=13, inkl. PageNumber):
+  //   Farbe: 2 + 13*12 + 4 + 6 (BPS) + 16 (2 RATIONALs) = 184
+  //   Grau:  2 + 13*12 + 4 + 0       + 16               = 178
+  const IFD_SIZE_COLOR_MULTI = 2 + 13 * 12 + 4 + 6 + 16; // 184
+  const IFD_SIZE_GRAY_MULTI  = 2 + 13 * 12 + 4 + 16;     // 178
 
   var IFDSize: Integer;
   if Options.Grayscale then
-    IFDSize := IFD_SIZE_GRAY
+    IFDSize := IFD_SIZE_GRAY_MULTI
   else
-    IFDSize := IFD_SIZE_COLOR;
+    IFDSize := IFD_SIZE_COLOR_MULTI;
 
   Cur := 8; // nach TIFF-Header
   for I := 0 to Count - 1 do
@@ -1016,11 +1004,9 @@ begin
 
     for I := 0 to Count - 1 do
     begin
-      var NextIFD: Cardinal;
+      var NextIFD: Cardinal := 0;
       if I < Count - 1 then
-        NextIFD := IFDOffsets[I + 1]
-      else
-        NextIFD := 0;
+        NextIFD := IFDOffsets[I + 1];
 
       WriteTiffIFD(MS, I, Count,
                    PageWidths[I], PageHeights[I],
