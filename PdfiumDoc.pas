@@ -228,7 +228,6 @@ var
   Page   : FPDF_PAGE;
   Bitmap : FPDF_BITMAP;
   Flags  : Integer;
-  Fmt    : Integer;
   Stride : Integer;
   Src    : PByte;
   Dst    : PByte;
@@ -244,15 +243,19 @@ begin
     if Width  < 1 then Width  := 1;
     if Height < 1 then Height := 1;
 
-    // Grayscale: echtes 1-bpp-Bitmap via CreateEx;  Farbe: 3-bpp BGRx
+    // FPDFBitmap_CreateEx mit explizitem Format:
+    //   Gray = 1 Byte/Pixel, BGR = 3 Bytes/Pixel (kein Padding-Byte x)
+    // FPDFBitmap_Create liefert dagegen immer BGRx (4 Bytes/Pixel),
+    // was beim zeilenweisen Kopieren von Width*3 Bytes zu falschen
+    // Farbwerten führt (Padding-Byte landet als Farbkanal).
     if Grayscale then
       Bitmap := FPDFBitmap_CreateEx(Width, Height, FPDFBitmap_Gray, nil, 0)
     else
-      Bitmap := FPDFBitmap_Create(Width, Height, 0 {no alpha});
+      Bitmap := FPDFBitmap_CreateEx(Width, Height, FPDFBitmap_BGR,  nil, 0);
     if Bitmap = nil then
-      raise EPdfiumError.Create('FPDFBitmap_Create fehlgeschlagen.');
+      raise EPdfiumError.Create('FPDFBitmap_CreateEx fehlgeschlagen.');
     try
-      // weißer Hintergrund
+      // weißer Hintergrund ($FFFFFF für BGR, $FF für Gray)
       FPDFBitmap_FillRect(Bitmap, 0, 0, Width, Height, $FFFFFFFF);
 
       Flags := FPDF_PRINTING;
@@ -266,7 +269,7 @@ begin
 
       if Grayscale then
       begin
-        // 1 Byte pro Pixel – Stride kann >= Width sein (Padding)
+        // 1 Byte/Pixel – Stride ≥ Width (ggf. 4-Byte-Alignment)
         SetLength(Result, Width * Height);
         Dst := Pointer(Result);
         for Row := 0 to Height - 1 do
@@ -274,7 +277,7 @@ begin
       end
       else
       begin
-        // 3 Bytes pro Pixel (BGR) – Stride kann > Width*3 sein
+        // 3 Bytes/Pixel BGR – Stride ≥ Width*3 (ggf. 4-Byte-Alignment)
         SetLength(Result, Width * Height * 3);
         Dst := Pointer(Result);
         for Row := 0 to Height - 1 do
