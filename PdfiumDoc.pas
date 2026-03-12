@@ -147,7 +147,9 @@ begin
   Result.DPI         := 150;
   Result.Compression := tcPackBits;
   Result.Grayscale   := False;
-  Result.ScaleFactor := 1.0;
+  // ScaleFactor = DPI / 72, damit die gerenderten Pixel zu den
+  // DPI-Metadaten im TIFF-Header passen (1 PDF-Point = 1/72 Inch)
+  Result.ScaleFactor := Result.DPI / 72.0;
 end;
 
 // Liest einen PDFium-UTF-16LE-Puffer und liefert einen Delphi-String
@@ -890,10 +892,13 @@ begin
 
   MS := TMemoryStream.Create;
   try
-    // TIFF-Header (8 Bytes): Magic 'II', 42, Offset erstes IFD
-    MS.WriteBuffer(AnsiString('II'), 2);
-    WriteWord(MS, 42);
-    WriteDWord(MS, 8);  // IFD beginnt unmittelbar nach dem Header
+    // TIFF-Header (8 Bytes): Byte-Order 'II' (LE), Magic 42, IFD-Offset
+    // WICHTIG: WriteBuffer(AnsiString('II'), 2) wäre FALSCH – Delphi würde
+    // den 4/8-Byte-Heap-Pointer der AnsiString-Variable übergeben, nicht
+    // die Zeichen. WriteWord($4949) schreibt exakt die Bytes $49 $49 = 'II'.
+    WriteWord(MS, $4949);   // 'II' = Little-Endian-Marker
+    WriteWord(MS, 42);      // TIFF Magic Number
+    WriteDWord(MS, 8);      // IFD beginnt unmittelbar nach dem Header
 
     WriteTiffIFD(MS, 0, 1 {single page}, PW, PH, Options.DPI,
                  Options.Compression, Options.Grayscale,
@@ -1007,9 +1012,9 @@ begin
 
   MS := TMemoryStream.Create;
   try
-    // TIFF-Header
-    MS.WriteBuffer(AnsiString('II'), 2);
-    WriteWord(MS, 42);
+    // TIFF-Header (siehe Kommentar in SavePageToTiff)
+    WriteWord(MS, $4949);   // 'II' = Little-Endian-Marker
+    WriteWord(MS, 42);      // TIFF Magic Number
     WriteDWord(MS, IFDOffsets[0]);
 
     for I := 0 to Count - 1 do
