@@ -225,13 +225,13 @@ end;
 function TPdfDocument.RenderPageToBGRBytes(PageIndex: Integer;
   out Width, Height: Integer; ScaleFactor: Double; Grayscale: Boolean): TBytes;
 var
-  Page   : FPDF_PAGE;
-  Bitmap : FPDF_BITMAP;
-  Flags  : Integer;
-  Stride : Integer;
-  Src    : PByte;
-  Dst    : PByte;
-  Row    : Integer;
+  Page    : FPDF_PAGE;
+  Bitmap  : FPDF_BITMAP;
+  Flags   : Integer;
+  Stride  : Integer;
+  Src     : PByte;
+  SrcRow  : PByte;
+  Row, Col: Integer;
 begin
   Result := nil;
   Page := FPDF_LoadPage(FDocument, PageIndex);
@@ -243,19 +243,16 @@ begin
     if Width  < 1 then Width  := 1;
     if Height < 1 then Height := 1;
 
-    // FPDFBitmap_CreateEx mit explizitem Format:
-    //   Gray = 1 Byte/Pixel, BGR = 3 Bytes/Pixel (kein Padding-Byte x)
-    // FPDFBitmap_Create liefert dagegen immer BGRx (4 Bytes/Pixel),
-    // was beim zeilenweisen Kopieren von Width*3 Bytes zu falschen
-    // Farbwerten führt (Padding-Byte landet als Farbkanal).
-    if Grayscale then
-      Bitmap := FPDFBitmap_CreateEx(Width, Height, FPDFBitmap_Gray, nil, 0)
-    else
-      Bitmap := FPDFBitmap_CreateEx(Width, Height, FPDFBitmap_BGR,  nil, 0);
+    // PDFium rendert intern immer mit BGRx (4 Bytes/Pixel).
+    // FPDFBitmap_BGR ist zwar spezifiziert, aber der interne Stride
+    // entspricht in manchen Versionen trotzdem Width*4 – das erzeugt
+    // horizontal verschobene Zeilen im Ergebnis.
+    // Lösung: immer BGRx anfordern und das Padding-Byte danach
+    // pixelweise manuell entfernen. Stride ist dann immer = Width*4.
+    Bitmap := FPDFBitmap_Create(Width, Height, 0);  // BGRx, alpha=0
     if Bitmap = nil then
-      raise EPdfiumError.Create('FPDFBitmap_CreateEx fehlgeschlagen.');
+      raise EPdfiumError.Create('FPDFBitmap_Create fehlgeschlagen.');
     try
-      // weißer Hintergrund ($FFFFFF für BGR, $FF für Gray)
       FPDFBitmap_FillRect(Bitmap, 0, 0, Width, Height, $FFFFFFFF);
 
       Flags := FPDF_PRINTING;
@@ -264,24 +261,34 @@ begin
 
       FPDF_RenderPageBitmap(Bitmap, Page, 0, 0, Width, Height, 0, Flags);
 
-      Stride := FPDFBitmap_GetStride(Bitmap);
+      Stride := FPDFBitmap_GetStride(Bitmap);  // = Width*4 für BGRx
       Src    := FPDFBitmap_GetBuffer(Bitmap);
 
       if Grayscale then
       begin
-        // 1 Byte/Pixel – Stride ≥ Width (ggf. 4-Byte-Alignment)
+        // Bei FPDF_GRAYSCALE gilt B = G = R; wir nehmen Byte 0 (= B)
         SetLength(Result, Width * Height);
-        Dst := Pointer(Result);
         for Row := 0 to Height - 1 do
-          Move((Src + Row * Stride)^, (Dst + Row * Width)^, Width);
+        begin
+          SrcRow := Src + Row * Stride;
+          for Col := 0 to Width - 1 do
+            Result[Row * Width + Col] := SrcRow[Col * 4]; // B = G = R
+        end;
       end
       else
       begin
-        // 3 Bytes/Pixel BGR – Stride ≥ Width*3 (ggf. 4-Byte-Alignment)
+        // BGRx → BGR: x-Byte (Byte 3) überspringen
         SetLength(Result, Width * Height * 3);
-        Dst := Pointer(Result);
         for Row := 0 to Height - 1 do
-          Move((Src + Row * Stride)^, (Dst + Row * Width * 3)^, Width * 3);
+        begin
+          SrcRow := Src + Row * Stride;
+          for Col := 0 to Width - 1 do
+          begin
+            Result[Row * Width * 3 + Col * 3 + 0] := SrcRow[Col * 4 + 0]; // B
+            Result[Row * Width * 3 + Col * 3 + 1] := SrcRow[Col * 4 + 1]; // G
+            Result[Row * Width * 3 + Col * 3 + 2] := SrcRow[Col * 4 + 2]; // R
+          end;
+        end;
       end;
     finally
       FPDFBitmap_Destroy(Bitmap);
