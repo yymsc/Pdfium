@@ -719,8 +719,8 @@ end;
 // ----------------------------------------------------------------------------------
 destructor TccPdfiumDocument.Destroy;
 begin
-  FreeAndNil(FLock);   // ← neu, vor Close
-  Close;
+  Close;               // Dokument schließen bevor FLock freigegeben wird
+  FreeAndNil(FLock);
   inherited;
 end;
 
