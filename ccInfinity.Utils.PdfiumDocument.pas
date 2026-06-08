@@ -808,15 +808,20 @@ begin
   Result := '';
   CheckLoaded;
 
-  // Erste Abfrage: benötigte Puffergröße (Bytes, UTF-16LE inkl. Null-Terminator)
-  BufLen := TccPdfiumLibHelper.FPDF_GetMetaText(FDocument, PAnsiChar(AnsiString(ATag)), nil, 0);
-  if BufLen <= 2 then
-    Exit; // Leer oder nur Null-Terminator
+  FLock.Acquire;
+  try
+    // Erste Abfrage: benötigte Puffergröße (Bytes, UTF-16LE inkl. Null-Terminator)
+    BufLen := TccPdfiumLibHelper.FPDF_GetMetaText(FDocument, PAnsiChar(AnsiString(ATag)), nil, 0);
+    if BufLen <= 2 then
+      Exit; // Leer oder nur Null-Terminator
 
-  SetLength(Buf, BufLen);
-  TccPdfiumLibHelper.FPDF_GetMetaText(FDocument, PAnsiChar(AnsiString(ATag)), @Buf[0], BufLen);
+    SetLength(Buf, BufLen);
+    TccPdfiumLibHelper.FPDF_GetMetaText(FDocument, PAnsiChar(AnsiString(ATag)), @Buf[0], BufLen);
+  finally
+    FLock.Release;
+  end;
 
-  // UTF-16LE → Delphi-String
+  // UTF-16LE → Delphi-String (außerhalb des Locks – reine Speicheroperation)
   Result := WideCharToString(PWideChar(@Buf[0]));
 
 end;
@@ -827,18 +832,23 @@ var
   Page : FPDF_PAGE;
 begin
   CheckPageIndex(APageIndex);
-  Page := TccPdfiumLibHelper.FPDF_LoadPage(FDocument, APageIndex);
-  if Page = nil
-    then raise EccException.Create(CCI_MSG_ERR_PIU_ERROROPENPAGE.Format([APageIndex]));
+  FLock.Acquire;
   try
-    Result.Index    := APageIndex;
-    Result.WidthPt  := TccPdfiumLibHelper.FPDF_GetPageWidthF(Page);
-    Result.HeightPt := TccPdfiumLibHelper.FPDF_GetPageHeightF(Page);
-    // Punkte → Millimeter: 1 Punkt = 25.4 / 72 mm
-    Result.WidthMM  := Result.WidthPt  * 25.4 / 72.0;
-    Result.HeightMM := Result.HeightPt * 25.4 / 72.0;
+    Page := TccPdfiumLibHelper.FPDF_LoadPage(FDocument, APageIndex);
+    if Page = nil
+      then raise EccException.Create(CCI_MSG_ERR_PIU_ERROROPENPAGE.Format([APageIndex]));
+    try
+      Result.Index    := APageIndex;
+      Result.WidthPt  := TccPdfiumLibHelper.FPDF_GetPageWidthF(Page);
+      Result.HeightPt := TccPdfiumLibHelper.FPDF_GetPageHeightF(Page);
+      // Punkte → Millimeter: 1 Punkt = 25.4 / 72 mm
+      Result.WidthMM  := Result.WidthPt  * 25.4 / 72.0;
+      Result.HeightMM := Result.HeightPt * 25.4 / 72.0;
+    finally
+      TccPdfiumLibHelper.FPDF_ClosePage(Page);
+    end;
   finally
-    TccPdfiumLibHelper.FPDF_ClosePage(Page);
+    FLock.Release;
   end;
 end;
 
@@ -848,13 +858,18 @@ var
   Page : FPDF_PAGE;
 begin
   CheckPageIndex(APageIndex);
-  Page := TccPdfiumLibHelper.FPDF_LoadPage(FDocument, APageIndex);
-  if Page = nil
-    then raise EccException.Create(CCI_MSG_ERR_PIU_ERROROPENPAGE1.Format([APageIndex]));
+  FLock.Acquire;
   try
-    Result := RenderPage(AStream, Page, ADPI);
+    Page := TccPdfiumLibHelper.FPDF_LoadPage(FDocument, APageIndex);
+    if Page = nil
+      then raise EccException.Create(CCI_MSG_ERR_PIU_ERROROPENPAGE1.Format([APageIndex]));
+    try
+      Result := RenderPage(AStream, Page, ADPI);
+    finally
+      TccPdfiumLibHelper.FPDF_ClosePage(Page);
+    end;
   finally
-    TccPdfiumLibHelper.FPDF_ClosePage(Page);
+    FLock.Release;
   end;
 end;
 
@@ -976,40 +991,46 @@ begin
   if not TccWebpLibHelper.TryInitialize
     then raise EccException.Create(CCI_MSG_ERR_PIU_INTERNAL.Format(['libwebp konnte nicht geladen werden']));
 
-  Page := TccPdfiumLibHelper.FPDF_LoadPage(FDocument, APageIndex);
-  if Page = nil
-    then raise EccException.Create(CCI_MSG_ERR_PIU_ERROROPENPAGE1.Format([APageIndex]));
+  FLock.Acquire;
   try
-    PageW := TccPdfiumLibHelper.FPDF_GetPageWidthF(Page);
-    PageH := TccPdfiumLibHelper.FPDF_GetPageHeightF(Page);
-
-    BmpW := Max(1, Round(PageW * ADpi / POINTS_PER_INCH));
-    BmpH := Max(1, Round(PageH * ADpi / POINTS_PER_INCH));
-
-    Bitmap := TccPdfiumLibHelper.FPDFBitmap_Create(BmpW, BmpH, 0 {kein Alpha -> BGRx});
-    if Bitmap = nil
-      then raise EccException.Create(CCI_MSG_ERR_PIU_CREATEFAILED);
+    Page := TccPdfiumLibHelper.FPDF_LoadPage(FDocument, APageIndex);
+    if Page = nil
+      then raise EccException.Create(CCI_MSG_ERR_PIU_ERROROPENPAGE1.Format([APageIndex]));
     try
-      // Weisser Hintergrund – setzt auch das Padding-Byte auf $FF, wodurch der
-      // BGRx-Puffer wie opakes BGRA aussieht (Alpha=$FF) und direkt an
-      // WebPEncodeBGRA uebergeben werden kann.
-      TccPdfiumLibHelper.FPDFBitmap_FillRect(Bitmap, 0, 0, BmpW, BmpH, $FFFFFFFF);
+      PageW := TccPdfiumLibHelper.FPDF_GetPageWidthF(Page);
+      PageH := TccPdfiumLibHelper.FPDF_GetPageHeightF(Page);
 
-      TccPdfiumLibHelper.FPDF_RenderPageBitmap(Bitmap, Page,
-        0, 0, BmpW, BmpH,
-        0, FPDF_ANNOT
-      );
+      BmpW := Max(1, Round(PageW * ADpi / POINTS_PER_INCH));
+      BmpH := Max(1, Round(PageH * ADpi / POINTS_PER_INCH));
 
-      BufPtr := TccPdfiumLibHelper.FPDFBitmap_GetBuffer(Bitmap);
-      Stride := TccPdfiumLibHelper.FPDFBitmap_GetStride(Bitmap);
+      Bitmap := TccPdfiumLibHelper.FPDFBitmap_Create(BmpW, BmpH, 0 {kein Alpha -> BGRx});
+      if Bitmap = nil
+        then raise EccException.Create(CCI_MSG_ERR_PIU_CREATEFAILED);
+      try
+        // Weisser Hintergrund – setzt auch das Padding-Byte auf $FF, wodurch der
+        // BGRx-Puffer wie opakes BGRA aussieht (Alpha=$FF) und direkt an
+        // WebPEncodeBGRA uebergeben werden kann.
+        TccPdfiumLibHelper.FPDFBitmap_FillRect(Bitmap, 0, 0, BmpW, BmpH, $FFFFFFFF);
 
-      Result := EncodeBgraToWebpStream(AStream, BufPtr, BmpW, BmpH, Stride, AOptions);
+        TccPdfiumLibHelper.FPDF_RenderPageBitmap(Bitmap, Page,
+          0, 0, BmpW, BmpH,
+          0, FPDF_ANNOT
+        );
+
+        BufPtr := TccPdfiumLibHelper.FPDFBitmap_GetBuffer(Bitmap);
+        Stride := TccPdfiumLibHelper.FPDFBitmap_GetStride(Bitmap);
+      finally
+        TccPdfiumLibHelper.FPDFBitmap_Destroy(Bitmap);
+      end;
     finally
-      TccPdfiumLibHelper.FPDFBitmap_Destroy(Bitmap);
+      TccPdfiumLibHelper.FPDF_ClosePage(Page);
     end;
   finally
-    TccPdfiumLibHelper.FPDF_ClosePage(Page);
+    FLock.Release;
   end;
+
+  // WebP-Encoding außerhalb des Locks – arbeitet nur auf dem lokalen Puffer
+  Result := EncodeBgraToWebpStream(AStream, BufPtr, BmpW, BmpH, Stride, AOptions);
 end;
 
 // ---------------------------------------------------------------------------
@@ -2118,21 +2139,27 @@ var
 begin
   Result := False;
   CheckPageIndex(APageIndex);
-  Page := TccPdfiumLibHelper.FPDF_LoadPage(FDocument, APageIndex);
-  if Page = nil
-    then raise EccException.Create(CCI_MSG_ERR_PIU_ERROROPENPAGE1.Format([APageIndex]));
+  FLock.Acquire;
   try
-    if not RenderPageToRaw(Page, ADpi, W, H, Buf) then Exit;
-
-    Pages[0]   := Buf;
-    Widths[0]  := W;
-    Heights[0] := H;
-    WriteTiffToStream(AStream, Pages, Widths, Heights, ADpi, ACompression, AGrayscale);
-    AStream.Position := 0;
-    Result := True;
+    Page := TccPdfiumLibHelper.FPDF_LoadPage(FDocument, APageIndex);
+    if Page = nil
+      then raise EccException.Create(CCI_MSG_ERR_PIU_ERROROPENPAGE1.Format([APageIndex]));
+    try
+      if not RenderPageToRaw(Page, ADpi, W, H, Buf) then Exit;
+    finally
+      TccPdfiumLibHelper.FPDF_ClosePage(Page);
+    end;
   finally
-    TccPdfiumLibHelper.FPDF_ClosePage(Page);
+    FLock.Release;
   end;
+
+  // TIFF-Encoding außerhalb des Locks – arbeitet nur auf lokalen Puffern
+  Pages[0]   := Buf;
+  Widths[0]  := W;
+  Heights[0] := H;
+  WriteTiffToStream(AStream, Pages, Widths, Heights, ADpi, ACompression, AGrayscale);
+  AStream.Position := 0;
+  Result := True;
 end;
 
 // ---------------------------------------------------------------------------
@@ -2320,17 +2347,22 @@ begin
     OutFiles[i] := Dir + ABaseName + Format('%.' + IntToStr(Digits) + 'd', [i+1]) + '.tiff';
 
   // Phase 1: Serielles Rendering
-  for i := 0 to n - 1 do
-  begin
-    Page := TccPdfiumLibHelper.FPDF_LoadPage(FDocument, i);
-    if Page = nil then
-      raise EccException.Create(CCI_MSG_ERR_PIU_ERROROPENPAGE1.Format([i]));
-    try
-      if not RenderPageToRaw(Page, ADpi, AllWidths[i], AllHeights[i], AllRaw[i]) then
-        raise EccException.Create(CCI_MSG_ERR_PIU_INTERNAL.Format(['RenderPageToRaw Seite ' + IntToStr(i)]));
-    finally
-      TccPdfiumLibHelper.FPDF_ClosePage(Page);
+  FLock.Acquire;
+  try
+    for i := 0 to n - 1 do
+    begin
+      Page := TccPdfiumLibHelper.FPDF_LoadPage(FDocument, i);
+      if Page = nil then
+        raise EccException.Create(CCI_MSG_ERR_PIU_ERROROPENPAGE1.Format([i]));
+      try
+        if not RenderPageToRaw(Page, ADpi, AllWidths[i], AllHeights[i], AllRaw[i]) then
+          raise EccException.Create(CCI_MSG_ERR_PIU_INTERNAL.Format(['RenderPageToRaw Seite ' + IntToStr(i)]));
+      finally
+        TccPdfiumLibHelper.FPDF_ClosePage(Page);
+      end;
     end;
+  finally
+    FLock.Release;
   end;
 
   // Phase 2: Parallele Kompression
@@ -2390,7 +2422,12 @@ begin
   CheckLoaded;
   if not Assigned(TccPdfiumLibHelper.FPDFDoc_GetAttachmentCount)
     then raise EccException.Create(CCI_MSG_ERR_PIU_GETATTACHMENTERROR);
-  Result := TccPdfiumLibHelper.FPDFDoc_GetAttachmentCount(FDocument);
+  FLock.Acquire;
+  try
+    Result := TccPdfiumLibHelper.FPDFDoc_GetAttachmentCount(FDocument);
+  finally
+    FLock.Release;
+  end;
 end;
 
 // ---------------------------------------------------------------------------
@@ -2405,29 +2442,34 @@ begin
   if (AIndex < 0) or (AIndex >= AttachmentCount)
     then raise EccException.Create(CCI_MSG_ERR_PIU_INVALIDATTACHMENTINDEX.Format([AIndex, AttachmentCount - 1]));
 
-  Att := TccPdfiumLibHelper.FPDFDoc_GetAttachment(FDocument, AIndex);
-  if Att = nil
-    then raise EccException.Create(CCI_MSG_ERR_PIU_ATTACHMENTNOTAVAILABLE.Format([AIndex]));
+  FLock.Acquire;
+  try
+    Att := TccPdfiumLibHelper.FPDFDoc_GetAttachment(FDocument, AIndex);
+    if Att = nil
+      then raise EccException.Create(CCI_MSG_ERR_PIU_ATTACHMENTNOTAVAILABLE.Format([AIndex]));
 
-  Result.Index := AIndex;
+    Result.Index := AIndex;
 
-  // Name abrufen (UTF-16LE)
-  BufLen := TccPdfiumLibHelper.FPDFAttachment_GetName(Att, nil, 0);
-  if BufLen > 0 then
-  begin
-    SetLength(WBuf, BufLen div 2 + 1);
-    TccPdfiumLibHelper.FPDFAttachment_GetName(Att, @WBuf[0], BufLen);
-    Result.Name := WideCharToString(@WBuf[0]);
-  end
-  else
-    Result.Name := Format('attachment_%d', [AIndex]);
+    // Name abrufen (UTF-16LE)
+    BufLen := TccPdfiumLibHelper.FPDFAttachment_GetName(Att, nil, 0);
+    if BufLen > 0 then
+    begin
+      SetLength(WBuf, BufLen div 2 + 1);
+      TccPdfiumLibHelper.FPDFAttachment_GetName(Att, @WBuf[0], BufLen);
+      Result.Name := WideCharToString(@WBuf[0]);
+    end
+    else
+      Result.Name := Format('attachment_%d', [AIndex]);
 
-  // Größe ermitteln (nur Länge abfragen, kein Puffer)
-  DataLen := 0;
-  if TccPdfiumLibHelper.FPDFAttachment_GetFile(Att, nil, 0, @DataLen) then
-    Result.Size := DataLen
-  else
-    Result.Size := -1;
+    // Größe ermitteln (nur Länge abfragen, kein Puffer)
+    DataLen := 0;
+    if TccPdfiumLibHelper.FPDFAttachment_GetFile(Att, nil, 0, @DataLen) then
+      Result.Size := DataLen
+    else
+      Result.Size := -1;
+  finally
+    FLock.Release;
+  end;
 end;
 
 // ---------------------------------------------------------------------------
@@ -2436,31 +2478,36 @@ var
   Att       : FPDF_ATTACHMENT;
   DataLen   : LongWord;
   ActualLen : LongWord;
-  Buffer : TBytes;
+  Buffer    : TBytes;
 begin
   Result := false;
   CheckLoaded;
   if (AIndex < 0) or (AIndex >= AttachmentCount)
     then raise EccException.Create(CCI_MSG_ERR_PIU_INVALIDATTACHMENTINDEX1.Format([AIndex, AttachmentCount - 1]));
 
-  Att := TccPdfiumLibHelper.FPDFDoc_GetAttachment(FDocument, AIndex);
-  if Att = nil
-    then raise EccException.Create(CCI_MSG_ERR_PIU_ATTACHMENTNOTAVAILABLE1.Format([AIndex]));
+  FLock.Acquire;
+  try
+    Att := TccPdfiumLibHelper.FPDFDoc_GetAttachment(FDocument, AIndex);
+    if Att = nil
+      then raise EccException.Create(CCI_MSG_ERR_PIU_ATTACHMENTNOTAVAILABLE1.Format([AIndex]));
 
-  // Größe ermitteln
-  DataLen := 0;
-  if not TccPdfiumLibHelper.FPDFAttachment_GetFile(Att, nil, 0, @DataLen)
-    then raise EccException.Create(CCI_MSG_ERR_PIU_ATTACHMENTSIZEERROR.Format([AIndex]));
+    // Größe ermitteln
+    DataLen := 0;
+    if not TccPdfiumLibHelper.FPDFAttachment_GetFile(Att, nil, 0, @DataLen)
+      then raise EccException.Create(CCI_MSG_ERR_PIU_ATTACHMENTSIZEERROR.Format([AIndex]));
 
-  if DataLen = 0
-    then Exit;
+    if DataLen = 0
+      then Exit;
 
-//  AStream.SetSize(Int64(DataLen));
-  SetLength(Buffer, DataLen);
-  ActualLen := DataLen;
-  if not TccPdfiumLibHelper.FPDFAttachment_GetFile(Att, Buffer, DataLen, @ActualLen)
-    then raise EccException.Create(CCI_MSG_ERR_PIU_ATTACHMENTREADERROR.Format([AIndex]));
-//  AStream.SetSize(Int64(ActualLen));
+    SetLength(Buffer, DataLen);
+    ActualLen := DataLen;
+    if not TccPdfiumLibHelper.FPDFAttachment_GetFile(Att, Buffer, DataLen, @ActualLen)
+      then raise EccException.Create(CCI_MSG_ERR_PIU_ATTACHMENTREADERROR.Format([AIndex]));
+  finally
+    FLock.Release;
+  end;
+
+  // Stream-Write außerhalb des Locks – arbeitet nur auf dem lokalen Buffer
   AStream.WriteBuffer(Buffer[0], ActualLen);
   AStream.Position := 0;
   Result := True;
