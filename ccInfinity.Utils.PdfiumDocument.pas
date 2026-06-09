@@ -1421,13 +1421,17 @@ var
   Row          : PByte;
   x, y         : Integer;
 begin
+  Result := False;
+  AWidth  := 0;
+  AHeight := 0;
+  ABuf    := nil;
+
   PageW := TccPdfiumLibHelper.FPDF_GetPageWidthF(APage);
   PageH := TccPdfiumLibHelper.FPDF_GetPageHeightF(APage);
   AWidth  := Max(1, Round(PageW * ADpi / POINTS_PER_INCH));
   AHeight := Max(1, Round(PageH * ADpi / POINTS_PER_INCH));
 
   // FPDFBitmap_Create: PDFium verwaltet den Puffer intern (BGRx, 4 Bytes/Px).
-  // Kein externer Zeiger → kein Risiko durch Reallokation von ABuf.
   Bitmap := TccPdfiumLibHelper.FPDFBitmap_Create(AWidth, AHeight, 0);
   if Bitmap = nil then
     raise EccException.Create(CCI_MSG_ERR_PIU_CREATEFAILED);
@@ -1437,6 +1441,9 @@ begin
 
     BufPtr := TccPdfiumLibHelper.FPDFBitmap_GetBuffer(Bitmap);
     Stride := TccPdfiumLibHelper.FPDFBitmap_GetStride(Bitmap);
+
+    if (BufPtr = nil) or (Stride <= 0) then
+      raise EccException.Create(CCI_MSG_ERR_PIU_INTERNAL.Format(['FPDFBitmap_GetBuffer lieferte nil']));
 
     // BGRx (4 Bytes/Px) → RGB (3 Bytes/Px) in ABuf umkopieren, dabei B↔R tauschen
     SetLength(ABuf, AWidth * AHeight * 3);
@@ -1456,7 +1463,9 @@ begin
     {$R+}{$Q+}
     Result := True;
   finally
-    TccPdfiumLibHelper.FPDFBitmap_Destroy(Bitmap);
+    // Bitmap immer freigeben – PDFium-eigener Puffer, kein Delphi-Heap
+    if Bitmap <> nil then
+      TccPdfiumLibHelper.FPDFBitmap_Destroy(Bitmap);
   end;
 end;
 
