@@ -309,7 +309,6 @@ type
     FLoaded    : Boolean;
     FPageCount : Integer;
     FStreamBuffer : TMemoryStream; // haelt den Puffer fuer FPDF_LoadMemDocument am Leben
-    FLock : TCriticalSection;   // ← neu: schützt PDFium-Zugriff auf FDocument
 
     procedure CheckLoaded;
     procedure CheckPageIndex(AIndex : Integer);
@@ -346,9 +345,14 @@ type
     class function  WebpStreamToPdfiumBitmap(AStream : TStream;
                       out AImgW, AImgH : Integer) : FPDF_BITMAP; static;
     private class var
-      FParallelDepth : Integer;   // ← neu: verhindert verschachtelte TParallel.For
+      FParallelDepth : Integer;
+      // Globaler Lock für alle PDFium-Aufrufe – PDFium ist nicht thread-sicher,
+      // auch nicht über verschiedene Dokumente hinweg (gemeinsamer interner Zustand).
+      FLock          : TCriticalSection;
   {$ENDREGION}
   public
+    class constructor Create;
+    class destructor  Destroy;
     constructor Create;
     destructor  Destroy; override;
 
@@ -702,6 +706,19 @@ end;
 { TccPdfiumDocument }
 
 // ----------------------------------------------------------------------------------
+class constructor TccPdfiumDocument.Create;
+begin
+  FLock          := TCriticalSection.Create;
+  FParallelDepth := 0;
+end;
+
+// ----------------------------------------------------------------------------------
+class destructor TccPdfiumDocument.Destroy;
+begin
+  FreeAndNil(FLock);
+end;
+
+// ----------------------------------------------------------------------------------
 constructor TccPdfiumDocument.Create;
 begin
   inherited Create;
@@ -710,7 +727,6 @@ begin
   FLoaded    := False;
   FPageCount := 0;
   FFileName  := '';
-  FLock := TCriticalSection.Create;
 
   if TccPdfiumLibHelper.TryInitialize = false
     then raise EccException.Create(CCI_MSG_ERR_PIU_UNABLETOLOAD);
@@ -719,8 +735,7 @@ end;
 // ----------------------------------------------------------------------------------
 destructor TccPdfiumDocument.Destroy;
 begin
-  Close;               // Dokument schließen bevor FLock freigegeben wird
-  FreeAndNil(FLock);
+  Close;
   inherited;
 end;
 
@@ -730,8 +745,7 @@ var
   OldBuffer : TMemoryStream;
 begin
   OldBuffer := nil;
-  // FLock kann hier nil sein wenn Close aus dem Destruktor vor FLock.Create kommt
-  if Assigned(FLock) then FLock.Acquire;
+  FLock.Acquire;
   try
     if FLoaded and Assigned(TccPdfiumLibHelper.FPDF_CloseDocument) then
     begin
