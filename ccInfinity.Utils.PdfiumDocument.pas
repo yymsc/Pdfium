@@ -726,73 +726,115 @@ end;
 
 // ---------------------------------------------------------------------------
 procedure TccPdfiumDocument.Close;
+var
+  OldBuffer : TMemoryStream;
 begin
-  if FLoaded and Assigned(TccPdfiumLibHelper.FPDF_CloseDocument) then
-  begin
-    TccPdfiumLibHelper.FPDF_CloseDocument(FDocument);
-    FDocument  := nil;
-    FLoaded    := False;
-    FPageCount := 0;
-    FFileName  := '';
+  OldBuffer := nil;
+  // FLock kann hier nil sein wenn Close aus dem Destruktor vor FLock.Create kommt
+  if Assigned(FLock) then FLock.Acquire;
+  try
+    if FLoaded and Assigned(TccPdfiumLibHelper.FPDF_CloseDocument) then
+    begin
+      TccPdfiumLibHelper.FPDF_CloseDocument(FDocument);
+      FDocument  := nil;
+      FLoaded    := False;
+      FPageCount := 0;
+      FFileName  := '';
+    end;
+    // Puffer nach CloseDocument aus dem Lock nehmen – Free außerhalb
+    OldBuffer    := FStreamBuffer;
+    FStreamBuffer := nil;
+  finally
+    if Assigned(FLock) then FLock.Release;
   end;
-  // Puffer NACH CloseDocument freigeben - PDFium darf ihn bis dahin noch lesen
-  FreeAndNil(FStreamBuffer);
+  // FreeAndNil außerhalb des Locks – kein PDFium-Zugriff mehr nötig
+  FreeAndNil(OldBuffer);
 end;
 
 
 // ---------------------------------------------------------------------------
 procedure TccPdfiumDocument.OpenFile(const AFileName : String; const APassword : String);
 var
-  ErrCode : UInt32;
+  ErrCode  : UInt32;
+  NewDoc   : FPDF_DOCUMENT;
+  NewCount : Integer;
 begin
-  if FLoaded then Close;
+  // Laden außerhalb des Locks – kann lange dauern
+  NewDoc := TccPdfiumLibHelper.FPDF_LoadDocument(
+              PAnsiChar(AnsiString(AFileName)), PAnsiChar(AnsiString(APassword)));
 
-  FDocument := TccPdfiumLibHelper.FPDF_LoadDocument(PAnsiChar(AnsiString(AFileName)), PAnsiChar(AnsiString(APassword)));
-
-  if FDocument = nil then
+  if NewDoc = nil then
   begin
     ErrCode := TccPdfiumLibHelper.FPDF_GetLastError();
-    raise EccException.Create(CCI_MSG_ERR_PIU_ERROROPENFILE.Format([ErrCode,AFileName]));
+    raise EccException.Create(CCI_MSG_ERR_PIU_ERROROPENFILE.Format([ErrCode, AFileName]));
   end;
 
-  FFileName  := AFileName;
-  FPageCount := TccPdfiumLibHelper.FPDF_GetPageCount(FDocument);
-  FLoaded    := True;
+  NewCount := TccPdfiumLibHelper.FPDF_GetPageCount(NewDoc);
+
+  FLock.Acquire;
+  try
+    // Altes Dokument atomar ersetzen
+    if FLoaded and Assigned(TccPdfiumLibHelper.FPDF_CloseDocument) then
+      TccPdfiumLibHelper.FPDF_CloseDocument(FDocument);
+    FreeAndNil(FStreamBuffer);
+    FDocument  := NewDoc;
+    FFileName  := AFileName;
+    FPageCount := NewCount;
+    FLoaded    := True;
+  finally
+    FLock.Release;
+  end;
 end;
 
 // ---------------------------------------------------------------------------
 procedure TccPdfiumDocument.OpenStream(AStream : TStream; const APassword : String);
+var
+  NewBuffer : TMemoryStream;
+  NewDoc    : FPDF_DOCUMENT;
+  NewCount  : Integer;
 begin
-  if FLoaded then Close;
   if AStream = nil
     then raise EccException.Create(CCI_MSG_ERR_PIU_EMPTYSTREAM);
 
-  // FPDF_LoadMemDocument haelt nur einen Zeiger auf den Puffer - keine interne Kopie.
-  // FStreamBuffer muss deshalb so lange leben wie das Dokument geoeffnet ist.
-  // Close() gibt FStreamBuffer erst NACH FPDF_CloseDocument frei.
-  // Wir kopieren den Inhalt immer in einen eigenen Puffer, unabhaengig davon
-  // ob AStream bereits ein TMemoryStream ist - der Aufrufer kann seinen Stream
-  // danach jederzeit schliessen.
-  FStreamBuffer := TMemoryStream.Create;
-  AStream.Position := 0;
-  FStreamBuffer.CopyFrom(AStream, 0);
+  // Puffer + Laden außerhalb des Locks – CopyFrom kann lange dauern
+  NewBuffer := TMemoryStream.Create;
+  try
+    AStream.Position := 0;
+    NewBuffer.CopyFrom(AStream, 0);
 
-  FDocument := TccPdfiumLibHelper.FPDF_LoadMemDocument(
-    FStreamBuffer.Memory,
-    FStreamBuffer.Size,
-    PAnsiChar(AnsiString(APassword))
-  );
+    NewDoc := TccPdfiumLibHelper.FPDF_LoadMemDocument(
+      NewBuffer.Memory,
+      NewBuffer.Size,
+      PAnsiChar(AnsiString(APassword))
+    );
 
-  if FDocument = nil then
-  begin
-    TccPdfiumLibHelper.FPDF_GetLastError();
-    FreeAndNil(FStreamBuffer);
-    raise EccException.Create(CCI_MSG_ERR_PIU_INTERNAL.Format(['Fehler beim Öffnen aus Stream']));
+    if NewDoc = nil then
+    begin
+      TccPdfiumLibHelper.FPDF_GetLastError();
+      FreeAndNil(NewBuffer);
+      raise EccException.Create(CCI_MSG_ERR_PIU_INTERNAL.Format(['Fehler beim Öffnen aus Stream']));
+    end;
+
+    NewCount := TccPdfiumLibHelper.FPDF_GetPageCount(NewDoc);
+
+    FLock.Acquire;
+    try
+      // Altes Dokument atomar ersetzen
+      if FLoaded and Assigned(TccPdfiumLibHelper.FPDF_CloseDocument) then
+        TccPdfiumLibHelper.FPDF_CloseDocument(FDocument);
+      FreeAndNil(FStreamBuffer);
+      FStreamBuffer := NewBuffer;
+      NewBuffer     := nil;   // Ownership übertragen
+      FDocument     := NewDoc;
+      FFileName     := '<Stream>';
+      FPageCount    := NewCount;
+      FLoaded       := True;
+    finally
+      FLock.Release;
+    end;
+  finally
+    FreeAndNil(NewBuffer);  // nur im Fehlerfall noch belegt
   end;
-
-  FFileName  := '<Stream>';
-  FPageCount := TccPdfiumLibHelper.FPDF_GetPageCount(FDocument);
-  FLoaded    := True;
 end;
 
 // ---------------------------------------------------------------------------
