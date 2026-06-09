@@ -1410,70 +1410,48 @@ end;
 // ---------------------------------------------------------------------------
 function TccPdfiumDocument.RenderPageToRaw(APage : FPDF_PAGE; ADpi : Integer;
             out AWidth, AHeight : Integer; out ABuf : TBytes) : Boolean;
-// Opt: FPDFBitmap_BGR (Format 2) – PDFium rendert direkt in ABuf (3 Bytes/Px,
-// kein Padding, keine interne Kopie). Danach nur noch R↔B in-place tauschen.
 const
   POINTS_PER_INCH = 72.0;
 var
   PageW, PageH : Single;
   Bitmap       : FPDF_BITMAP;
-  Total        : Integer;
-  i            : Integer;
-  Px           : PByte;
-  Tmp          : Byte;
+  BufPtr       : Pointer;
+  Stride       : Integer;
+  Dst          : PByte;
+  Row          : PByte;
+  x, y         : Integer;
 begin
   PageW := TccPdfiumLibHelper.FPDF_GetPageWidthF(APage);
   PageH := TccPdfiumLibHelper.FPDF_GetPageHeightF(APage);
   AWidth  := Max(1, Round(PageW * ADpi / POINTS_PER_INCH));
   AHeight := Max(1, Round(PageH * ADpi / POINTS_PER_INCH));
 
-  SetLength(ABuf, AWidth * AHeight * 3);
-
-  Bitmap := TccPdfiumLibHelper.FPDFBitmap_CreateEx(
-              AWidth, AHeight, FPDFBitmap_BGR, @ABuf[0], AWidth * 3);
-
+  // FPDFBitmap_Create: PDFium verwaltet den Puffer intern (BGRx, 4 Bytes/Px).
+  // Kein externer Zeiger → kein Risiko durch Reallokation von ABuf.
+  Bitmap := TccPdfiumLibHelper.FPDFBitmap_Create(AWidth, AHeight, 0);
   if Bitmap = nil then
-  begin
-    // Fallback: BGRx mit Kopie
-    Bitmap := TccPdfiumLibHelper.FPDFBitmap_Create(AWidth, AHeight, 0);
-    if Bitmap = nil then raise EccException.Create(CCI_MSG_ERR_PIU_CREATEFAILED);
-    try
-      TccPdfiumLibHelper.FPDFBitmap_FillRect(Bitmap, 0, 0, AWidth, AHeight, $FFFFFFFF);
-      TccPdfiumLibHelper.FPDF_RenderPageBitmap(Bitmap, APage, 0, 0, AWidth, AHeight, 0, FPDF_ANNOT);
-      var BufPtr := TccPdfiumLibHelper.FPDFBitmap_GetBuffer(Bitmap);
-      var Stride := TccPdfiumLibHelper.FPDFBitmap_GetStride(Bitmap);
-      var Dst : PByte := @ABuf[0];
-      var Row : PByte;
-      var x, y : Integer;
-      {$R-}{$Q-}
-      for y := 0 to AHeight - 1 do
-      begin
-        Row := PByte(BufPtr) + y * Stride;
-        for x := 0 to AWidth - 1 do
-        begin
-          Dst^ := (Row+2)^; Inc(Dst);
-          Dst^ := (Row+1)^; Inc(Dst);
-          Dst^ :=  Row^;    Inc(Dst);
-          Inc(Row, 4);
-        end;
-      end;
-      {$R+}{$Q+}
-    finally
-      TccPdfiumLibHelper.FPDFBitmap_Destroy(Bitmap);
-    end;
-    Result := True; Exit;
-  end;
-
+    raise EccException.Create(CCI_MSG_ERR_PIU_CREATEFAILED);
   try
     TccPdfiumLibHelper.FPDFBitmap_FillRect(Bitmap, 0, 0, AWidth, AHeight, $FFFFFFFF);
     TccPdfiumLibHelper.FPDF_RenderPageBitmap(Bitmap, APage, 0, 0, AWidth, AHeight, 0, FPDF_ANNOT);
-    Total := AWidth * AHeight;
-    Px    := @ABuf[0];
+
+    BufPtr := TccPdfiumLibHelper.FPDFBitmap_GetBuffer(Bitmap);
+    Stride := TccPdfiumLibHelper.FPDFBitmap_GetStride(Bitmap);
+
+    // BGRx (4 Bytes/Px) → RGB (3 Bytes/Px) in ABuf umkopieren, dabei B↔R tauschen
+    SetLength(ABuf, AWidth * AHeight * 3);
+    Dst := @ABuf[0];
     {$R-}{$Q-}
-    for i := 0 to Total - 1 do
+    for y := 0 to AHeight - 1 do
     begin
-      Tmp := Px^; Px^ := (Px+2)^; (Px+2)^ := Tmp;
-      Inc(Px, 3);
+      Row := PByte(BufPtr) + y * Stride;
+      for x := 0 to AWidth - 1 do
+      begin
+        Dst^ := (Row+2)^; Inc(Dst);  // R
+        Dst^ := (Row+1)^; Inc(Dst);  // G
+        Dst^ :=  Row^;    Inc(Dst);  // B
+        Inc(Row, 4);                  // BGRx → nächstes Pixel
+      end;
     end;
     {$R+}{$Q+}
     Result := True;
